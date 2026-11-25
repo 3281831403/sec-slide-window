@@ -49,7 +49,7 @@ def _require_window(window: Any) -> int:
 
 def _require_add_timestamp(ts: Any) -> int:
     ts = _require_int(ts, "timestamp")
-    if ts < MIN_TIMESTAMP:
+    if ts < MIN_TIMESTAMP or ts > MAX_TIMESTAMP:
         raise ValueError("timestamp is out of range")
     return ts
 
@@ -92,13 +92,11 @@ def add_event(state: dict[str, Any], key: str, ts: int) -> dict[str, Any]:
 
     events = state.setdefault("events", {})
     bucket = events.setdefault(key, [])
-    if any(_event_ts(event) == ts for event in bucket):
-        return state
 
     seq = state.get("seq", 0)
     if isinstance(seq, bool) or not isinstance(seq, int):
         seq = 0
-    events.setdefault(key, []).append({"ts": ts, "seq": seq})
+    bucket.append({"ts": ts, "seq": seq})
     state["seq"] = seq + 1
     return state
 
@@ -111,9 +109,11 @@ def evict(state: dict[str, Any], key: str, now: int, window: int) -> dict[str, A
     window = _require_window(window)
 
     lower = now - window
-    events = state.setdefault("events", {})
+    events = state.get("events", {})
     bucket = events.get(key, [])
-    events[key] = [event for event in bucket if _event_ts(event) >= lower]
+    if not bucket:
+        return state
+    events[key] = [event for event in bucket if _event_ts(event) > lower]
     return state
 
 
@@ -126,22 +126,19 @@ def count(state: dict[str, Any], key: str, now: int, window: int) -> int:
 
     lower = now - window
     upper = now
-    events = state.setdefault("events", {})
-    bucket = events.get(key, [])
-    kept = [event for event in bucket if _event_ts(event) >= lower]
-    events[key] = kept
-    return sum(1 for event in kept if lower <= _event_ts(event) <= upper)
+    bucket = state.get("events", {}).get(key, [])
+    return sum(1 for event in bucket if lower < _event_ts(event) <= upper)
 
 
 def window_bounds(now: int, window: int) -> tuple[int, int]:
-    """Return the half-open interval represented by now and window."""
+    """Return the left-open, right-closed interval represented by now and window."""
     now = _require_now(now)
     window = _require_window(window)
-    return now - window * 1000, now
+    return now - window, now
 
 
 def merge_states(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
-    """Merge two states, keeping one event for each timestamp per key."""
+    """Merge two states, keeping events whose timestamp and sequence both match."""
     _require_state(a)
     _require_state(b)
 
@@ -228,7 +225,7 @@ def percentile(
     values = [
         _event_ts(event)
         for event in bucket
-        if lower <= _event_ts(event) <= upper
+        if lower < _event_ts(event) <= upper
     ]
     if not values:
         return 0.0
@@ -239,8 +236,6 @@ def percentile(
 def slide_batch(requests: list[Mapping[str, Any]]) -> dict[str, int]:
     """Run several independent window queries and return counts by key."""
     counts: dict[str, int] = {}
-    shared_events: list[dict[str, int]] = []
-    shared_state = _new_state()
 
     for request in requests:
         if not isinstance(request, Mapping):
@@ -252,11 +247,10 @@ def slide_batch(requests: list[Mapping[str, Any]]) -> dict[str, int]:
         _require_now(now)
         _require_window(window)
 
+        state = _new_state()
         for ts in request.get("events", []):
             _require_add_timestamp(ts)
-            shared_events.append({"ts": ts, "seq": shared_state["seq"]})
-            shared_state["seq"] += 1
+            add_event(state, key, ts)
 
-        shared_state["events"] = {key: shared_events}
-        counts[key] = count(shared_state, key, now, window)
+        counts[key] = count(state, key, now, window)
     return counts
